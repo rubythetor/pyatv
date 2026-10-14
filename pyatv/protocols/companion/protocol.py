@@ -1,6 +1,7 @@
 """Implementation of the Companion protocol."""
 
 from abc import ABC
+import asyncio
 from enum import Enum
 import logging
 from random import randint
@@ -17,7 +18,6 @@ from pyatv.protocols.companion.connection import (
     FrameType,
 )
 from pyatv.support import error_handler, opack
-from pyatv.support.collections import SharedData
 from pyatv.support.state_producer import StateProducer
 
 _LOGGER = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ class CompanionProtocol(
         self.srp = srp
         self.service = service
         self._xid: int = randint(0, 2**16)  # Don't know range here, just use something
-        self._queues: Dict[FrameIdType, SharedData[Any]] = {}
+        self._queues: Dict[FrameIdType, asyncio.Future] = {}
         self._chacha = None
         self._is_started = False
 
@@ -108,7 +108,12 @@ class CompanionProtocol(
 
     def stop(self):
         """Disconnect from device."""
-        self._queues = {}
+        for waiter in self._queues.values():
+            if not waiter.done():
+                waiter.set_exception(
+                    exceptions.ConnectionLostError("Companion stopped")
+                )
+        self._queues.clear()
         self.connection.close()
 
     async def _setup_encryption(self):
@@ -161,9 +166,13 @@ class CompanionProtocol(
     ) -> Dict[str, object]:
         _LOGGER.debug("Exchange OPACK: %s", data)
 
-        self.send_opack(frame_type, data)
-        self._queues[identifier] = SharedData()
-        unpacked_object = await self._queues[identifier].wait(timeout)
+        waiter = asyncio.get_running_loop().create_future()
+        self._queues[identifier] = waiter
+        try:
+            self.send_opack(frame_type, data)
+            unpacked_object = await asyncio.wait_for(waiter, timeout)
+        finally:
+            self._queues.pop(identifier, None)
 
         if not isinstance(unpacked_object, dict):
             raise exceptions.ProtocolError(
@@ -210,7 +219,8 @@ class CompanionProtocol(
         _LOGGER.debug("Process incoming auth frame (%s): %s", frame_type, opack_data)
         try:
             shared_data = self._queues.pop(frame_type)
-            shared_data.set(opack_data)
+            if not shared_data.done():
+                shared_data.set_result(opack_data)
         except KeyError:
             _LOGGER.warning("No receiver for auth frame %s", frame_type)
 
@@ -227,7 +237,8 @@ class CompanionProtocol(
             xid = opack_data.get("_x")
             if xid in self._queues:
                 shared_data = self._queues.pop(xid)
-                shared_data.set(opack_data)
+                if not shared_data.done():
+                    shared_data.set_result(opack_data)
             else:
                 _LOGGER.debug("No receiver for XID %s", xid)
         else:

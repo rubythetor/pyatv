@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 import pytest_asyncio
 
+from pyatv import exceptions
 from pyatv.auth.hap_srp import SRPAuthHandler
 from pyatv.conf import ManualService
 from pyatv.const import Protocol
@@ -61,3 +62,22 @@ async def test_heartbeat_fail_closes_connection(stub_sleep):
     assert total_sleep_time() == HEARTBEAT_INTERVAL
 
     protocol.connection.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_fails_pending_requests(mrp_protocol):
+    pending = asyncio.create_task(mrp_protocol._receive("pending", 60))
+    await asyncio.sleep(0)
+    mrp_protocol.stop()
+    with pytest.raises(exceptions.ConnectionLostError):
+        await asyncio.wait_for(pending, 0.1)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_is_removed(mrp_protocol):
+    pending = asyncio.create_task(mrp_protocol._receive("pending", 60))
+    await asyncio.sleep(0)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert not mrp_protocol._outstanding

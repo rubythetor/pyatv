@@ -4,7 +4,7 @@ import asyncio
 from collections import namedtuple
 from enum import Enum
 import logging
-from typing import Dict, NamedTuple, Optional
+from typing import Dict, Optional
 import uuid
 
 from pyatv import exceptions
@@ -28,13 +28,6 @@ SRP_OUTPUT_INFO = "MediaRemote-Write-Encryption-Key"
 SRP_INPUT_INFO = "MediaRemote-Read-Encryption-Key"
 
 Listener = namedtuple("Listener", "func data")
-
-
-class OutstandingMessage(NamedTuple):
-    """Sent message waiting for response."""
-
-    semaphore: asyncio.Semaphore
-    response: protobuf.ProtocolMessage
 
 
 class ProtocolState(Enum):
@@ -117,7 +110,7 @@ class MrpProtocol(MessageDispatcher[int, protobuf.ProtocolMessage]):
         self.info = info
         self.device_info: Optional[protobuf.ProtocolMessage] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
-        self._outstanding: Dict[str, OutstandingMessage] = {}
+        self._outstanding: Dict[str, asyncio.Future] = {}
         self._state: ProtocolState = ProtocolState.NOT_CONNECTED
 
     async def start(self, skip_initial_messages: bool = False) -> None:
@@ -172,16 +165,17 @@ class MrpProtocol(MessageDispatcher[int, protobuf.ProtocolMessage]):
         self._state = ProtocolState.READY
 
     def stop(self) -> None:
-        """Disconnect from device."""
-        if self._outstanding:
-            _LOGGER.warning(
-                "There were %d outstanding requests", len(self._outstanding)
-            )
-
+        """Disconnect from device and fail pending requests."""
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
-        self._outstanding = {}
+        for future in self._outstanding.values():
+            if not future.done():
+                future.set_exception(
+                    exceptions.ConnectionLostError("MRP session ended")
+                )
+        self._outstanding.clear()
+        self.device_info = None
         self.connection.close()
         self._state = ProtocolState.STOPPED
 
@@ -262,23 +256,13 @@ class MrpProtocol(MessageDispatcher[int, protobuf.ProtocolMessage]):
     async def _receive(
         self, identifier: str, timeout: float
     ) -> protobuf.ProtocolMessage:
-        semaphore = asyncio.Semaphore(value=0)
-        self._outstanding[identifier] = OutstandingMessage(
-            semaphore, protobuf.ProtocolMessage()
-        )
-
+        future = asyncio.get_running_loop().create_future()
+        self._outstanding[identifier] = future
         try:
-            # The connection instance will dispatch the message
             async with async_timeout(timeout):
-                await semaphore.acquire()
-
-        except Exception:
-            del self._outstanding[identifier]
-            raise
-
-        response = self._outstanding[identifier].response
-        del self._outstanding[identifier]
-        return response
+                return await future
+        finally:
+            self._outstanding.pop(identifier, None)
 
     def message_received(self, message: protobuf.ProtocolMessage, _) -> None:
         """Message was received from device."""
@@ -286,10 +270,8 @@ class MrpProtocol(MessageDispatcher[int, protobuf.ProtocolMessage]):
         # waiting for the response so we save it here
         identifier = message.identifier or "type_" + str(message.type)
         if identifier in self._outstanding:
-            outstanding = OutstandingMessage(
-                self._outstanding[identifier].semaphore, message
-            )
-            self._outstanding[identifier] = outstanding
-            self._outstanding[identifier].semaphore.release()
+            future = self._outstanding[identifier]
+            if not future.done():
+                future.set_result(message)
         else:
             self.dispatch(message.type, message)
