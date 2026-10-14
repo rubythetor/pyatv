@@ -12,7 +12,8 @@ from pyatv.auth.hap_pairing import parse_credentials
 from pyatv.auth.hap_srp import SRPAuthHandler
 from pyatv.const import InputAction, TouchAction
 from pyatv.core import Core
-from pyatv.core.protocol import MessageDispatcher
+from pyatv.core.protocol import MessageDispatcher, heartbeater
+from pyatv.interface import DeviceListener
 from pyatv.protocols.companion import keyed_archiver
 from pyatv.protocols.companion.connection import CompanionConnection, FrameType
 from pyatv.protocols.companion.plist_payloads import (
@@ -24,9 +25,14 @@ from pyatv.protocols.companion.protocol import (
     CompanionProtocolListener,
     MessageType,
 )
+from pyatv.support import async_timeout
+from pyatv.support.state_producer import StateProducer
 from pyatv.support.url import is_url_or_scheme
 
 _LOGGER = logging.getLogger(__name__)
+
+HEARTBEAT_TIMEOUT = 5.0
+RECOVERY_TIMEOUT = 30.0
 
 
 # pylint: disable=invalid-name
@@ -91,6 +97,31 @@ TOUCHPAD_DELAY_MS = 16  # Delay between touch events in ms
 # pylint: enable=invalid-name
 
 
+class _ConnectionListener(DeviceListener, CompanionProtocolListener):
+    """Ignore callbacks from a retired Companion session."""
+
+    def __init__(self, api: "CompanionAPI") -> None:
+        self.api = api
+        self.active = True
+        self.producer: StateProducer[DeviceListener] = StateProducer()
+        self.producer.listener = self
+
+    def connection_lost(self, exception: Exception) -> None:
+        """Forward a failure from the current connection."""
+        if self.active:
+            self.api.connection_lost(exception)
+
+    def connection_closed(self) -> None:
+        """Forward unexpected EOF from the current connection."""
+        if self.active:
+            self.api.connection_lost(exceptions.ConnectionLostError("Companion EOF"))
+
+    def event_received(self, event_name: str, data: Dict[str, Any]) -> None:
+        """Forward events only from the current connection."""
+        if self.active:
+            self.api.event_received(event_name, data)
+
+
 class CompanionAPI(
     MessageDispatcher[str, Mapping[str, Any]], CompanionProtocolListener
 ):
@@ -105,58 +136,165 @@ class CompanionAPI(
         self._subscribed_events: List[str] = []
         self.sid: int = 0
         self._base_timestamp = time.time_ns()
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._recovery_task: Optional[asyncio.Task] = None
+        self._initializing_task: Optional[asyncio.Task] = None
+        self._connection_listener: Optional[_ConnectionListener] = None
+        self._system_status = SystemStatus.Unknown
+        self._closed = False
 
     async def disconnect(self):
-        """Disconnect from companion device."""
+        """Disconnect permanently, including any pending standby recovery."""
+        self._closed = True
+        tasks = [task for task in (self._heartbeat_task, self._recovery_task) if task]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._heartbeat_task = self._recovery_task = None
         if self._protocol is None:
             return
 
+        # The closing task may send teardown commands; other callers may not
+        # reopen or use a session once disconnect has begun.
+        self._initializing_task = asyncio.current_task()
         try:
-            for event in self._subscribed_events:
+            for event in list(self._subscribed_events):
                 await self.unsubscribe_event(event)
-
-            # Sometimes unsubscribe fails for an unknown reason, but we are no
-            # going to bother with that and just swallow the error.
             await self._session_stop()
-
             await self._touch_stop()
             await self._text_input_stop()
         except Exception as ex:
             _LOGGER.debug("Ignoring error during disconnect: %s", ex)
         finally:
+            self._stop_protocol()
+            self._initializing_task = None
+
+    def _stop_protocol(self) -> None:
+        if self._connection_listener:
+            self._connection_listener.active = False
+        if self._heartbeat_task and self._heartbeat_task is not asyncio.current_task():
+            self._heartbeat_task.cancel()
+        self._heartbeat_task = None
+        if self._protocol:
             self._protocol.stop()
-            self._protocol = None
+        self._protocol = None
+        self._connection = None
 
     def event_received(self, event_name: str, data: Dict[str, Any]) -> None:
         """Event was received."""
         _LOGGER.debug("Got event %s from device: %s", event_name, data)
+        if event_name in ("SystemStatus", "TVSystemStatus"):
+            try:
+                self._system_status = SystemStatus(int(data["state"]))
+            except (KeyError, TypeError, ValueError):
+                pass
         self.dispatch(event_name, data)
 
     async def connect(self):
-        """Connect to remote host."""
+        """Connect and initialize a Companion session."""
+        current = asyncio.current_task()
+        if self._initializing_task is current:
+            return
+        if self._closed:
+            raise exceptions.InvalidStateError("Companion is closed")
+        if self._initializing_task or (
+            self._recovery_task and self._recovery_task is not current
+        ):
+            raise exceptions.InvalidStateError("Companion is initializing")
         if self._protocol:
             return
 
-        _LOGGER.debug("Connect to Companion from API")
+        self._initializing_task = current
+        self._connection_listener = _ConnectionListener(self)
         self._connection = CompanionConnection(
             self.core.loop,
             str(self.core.config.address),
             self.core.service.port,
-            self.core.device_listener,
+            self._connection_listener.producer,
         )
         self._protocol = CompanionProtocol(
             self._connection, SRPAuthHandler(), self.core.service
         )
-        self._protocol.listener = self
-        await self._protocol.start()
+        self._protocol.listener = self._connection_listener
+        try:
+            await self._protocol.start()
+            await self.system_info()
+            await self._touch_start()
+            await self._session_start()
+            await self._tv_rc_session_start()
+            await self._text_input_start()
+            # Registrations belong to the transport, but desired subscriptions
+            # and application listeners survive standby recovery.
+            for event in self._subscribed_events:
+                await self._send_event("_interest", {"_regEvents": [event]})
+            await self.subscribe_event("_iMC")
+        except (Exception, asyncio.CancelledError):
+            self._stop_protocol()
+            raise
+        finally:
+            self._initializing_task = None
+        if self._recovery_task is None:
+            self._start_heartbeat()
 
-        await self.system_info()
-        await self._touch_start()
-        await self._session_start()
-        await self._tv_rc_session_start()
-        await self._text_input_start()
+    def _start_heartbeat(self) -> None:
+        assert self._connection_listener is not None
+        self._heartbeat_task = asyncio.ensure_future(
+            heartbeater(
+                name=f"Companion:{self.core.config.address}",
+                sender_func=self._heartbeat,
+                failure_func=self._connection_listener.connection_lost,
+            )
+        )
 
-        await self.subscribe_event("_iMC")
+    def connection_lost(self, exc: Exception) -> None:
+        """Recover a retired standby session or report a genuine failure."""
+        if self._closed:
+            return
+        self._stop_protocol()
+        if self._recovery_task or self._initializing_task:
+            # Failing pending requests also fails the in-progress handshake.
+            return
+        if self._system_status == SystemStatus.Asleep:
+            self._recovery_task = asyncio.ensure_future(self._recover())
+        else:
+            self._closed = True
+            self.core.device_listener.listener.connection_lost(exc)
+
+    async def _recover(self) -> None:
+        # A sleeping device can stop answering on an established socket. Try
+        # one fresh authenticated session, bounded by a total deadline. Never
+        # replay the command that failed or hide an unreachable device.
+        try:
+            async with async_timeout(RECOVERY_TIMEOUT):
+                await self.connect()
+                await self._heartbeat(None)
+            self._start_heartbeat()
+        except asyncio.CancelledError:
+            self._stop_protocol()
+        except Exception as ex:
+            self._stop_protocol()
+            self._closed = True
+            self.core.device_listener.listener.connection_lost(ex)
+        finally:
+            self._recovery_task = None
+
+    async def _heartbeat(self, message: Optional[Any]) -> None:
+        # Even a "no handler" response proves the existing Companion session is
+        # alive. Ordinary commands continue to raise for remote error replies.
+        assert self._protocol is not None
+        response = await self._protocol.exchange_opack(
+            FrameType.E_OPACK,
+            {"_i": "FetchAttentionState", "_t": MessageType.Request.value, "_c": {}},
+            timeout=HEARTBEAT_TIMEOUT,
+            allow_error_response=True,
+        )
+        content = response.get("_c")
+        if isinstance(content, dict) and "state" in content:
+            try:
+                status = SystemStatus(int(content["state"]))
+            except (TypeError, ValueError):
+                return
+            self.event_received("SystemStatus", {"state": status.value})
 
     async def _send_command(
         self,
@@ -459,7 +597,8 @@ class CompanionAPI(
         if content is None:
             raise exceptions.ProtocolError("missing content")
 
-        return SystemStatus(content["state"])
+        self._system_status = SystemStatus(content["state"])
+        return self._system_status
 
     async def _touch_start(self) -> Mapping[str, Any]:
         """Subscribe to touch gestures."""

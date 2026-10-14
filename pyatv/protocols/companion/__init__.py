@@ -230,6 +230,9 @@ class CompanionPower(Power):
                 system_status
             )
 
+            self.api.core.state_dispatcher.dispatch(
+                UpdatedState.Power, self.power_state
+            )
             _LOGGER.debug("Initial power state is %s", self.power_state)
         except Exception as ex:
             _LOGGER.debug("Could not fetch initial SystemStatus (%s)", ex)
@@ -273,9 +276,14 @@ class CompanionPower(Power):
         return PowerState.Unknown
 
     def _update_power_state(self, old_state: PowerState, new_state: PowerState) -> None:
+        self.api.core.state_dispatcher.dispatch(UpdatedState.Power, new_state)
         if new_state != old_state:
             _LOGGER.debug("Power state changed from %s to %s", old_state, new_state)
-            self.loop.call_soon(self.listener.powerstate_update, old_state, new_state)
+            self.loop.call_soon(
+                self.listener.powerstate_update,  # pylint: disable=no-member
+                old_state,
+                new_state,
+            )
 
     async def turn_on(self, await_new_state: bool = False) -> None:
         """Turn device on."""

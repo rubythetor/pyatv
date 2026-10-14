@@ -245,6 +245,10 @@ class FakeCompanionService(CompanionServerAuth, asyncio.Protocol):
         _LOGGER.debug("Client disconnected")
         self.transport = None
         self.state.clients.remove(self)
+        if self in self.state.rti_clients:
+            self.state.rti_clients.remove(self)
+        if not self.state.rti_clients:
+            self.state.rti_session_uuid = None
 
     def enable_encryption(self, output_key: bytes, input_key: bytes) -> None:
         """Enable encryption with specified keys."""

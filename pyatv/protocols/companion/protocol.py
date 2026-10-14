@@ -150,12 +150,16 @@ class CompanionProtocol(
         frame_type: FrameType,
         data: Dict[str, Any],
         timeout: float = DEFAULT_TIMEOUT,
+        *,
+        allow_error_response: bool = False,
     ) -> Dict[str, object]:
         """Send data as OPACK and decode result as OPACK."""
         data["_x"] = self._xid
         identifier = self._xid
         self._xid += 1
-        return await self._exchange_generic_opack(frame_type, data, identifier, timeout)
+        return await self._exchange_generic_opack(
+            frame_type, data, identifier, timeout, allow_error_response
+        )
 
     async def _exchange_generic_opack(
         self,
@@ -163,6 +167,7 @@ class CompanionProtocol(
         data: Dict[str, Any],
         identifier: FrameIdType,
         timeout: float,
+        allow_error_response: bool = False,
     ) -> Dict[str, object]:
         _LOGGER.debug("Exchange OPACK: %s", data)
 
@@ -179,7 +184,7 @@ class CompanionProtocol(
                 f"Received unexpected type: {type(unpacked_object)}"
             )
 
-        if "_em" in unpacked_object:
+        if "_em" in unpacked_object and not allow_error_response:
             raise exceptions.ProtocolError(f"Command failed: {unpacked_object['_em']}")
 
         return unpacked_object

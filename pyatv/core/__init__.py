@@ -50,6 +50,9 @@ class UpdatedState(Enum):
     OutputDeviceVolume = 5
     """Output device volume was updated."""
 
+    Power = 6
+    """Power state observed by a protocol."""
+
 
 # pylint: enable=invalid-name
 
@@ -65,6 +68,7 @@ class StateMessage(NamedTuple):
     # - UpdatedState.Volume -> float
     # - UpdatedState.KeyboardFocus -> const.KeyboardFocusState
     # - UpdatedState.OutputDevices -> List[interface.OutputDevice]
+    # - UpdatedState.Power -> const.PowerState
     value: Any
 
     def __str__(self):
