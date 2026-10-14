@@ -190,7 +190,8 @@ class AP2Session:
         """Close all open connections."""
         tasks = set()
         if self._feedback_task:
-            self._feedback_task.cancel()
+            if self._feedback_task is not asyncio.current_task():
+                self._feedback_task.cancel()
             tasks.add(self._feedback_task)
             self._feedback_task = None
         if self.connection:
@@ -198,4 +199,8 @@ class AP2Session:
             self.connection = None
         for channel in self._channels:
             channel.close()
+        self._channels.clear()
+        self.data_channel = None
+        self.rtsp = None
+        self.verifier = None
         return tasks

@@ -1796,6 +1796,32 @@ CSeq: 0
 
 No other message has been seen on this channel with regards to remote control support.
 
+### Standby and wake
+
+Some Apple TVs retire an established MRP session while asleep. The data channel
+announces `SetConnectionState(Disconnected)` with error 115
+(`TheDeviceIsGoingToSleep`). This can precede a failed RTSP feedback request even
+though the device remains reachable. After wake, an RTSP response alone does not
+prove that the old MRP stream can carry commands or updates.
+
+When Companion independently reports that the device is asleep, pyatv retires
+that AirPlay session and suspends MRP. The two notifications may arrive in either
+order; a sleep announcement is correlated with Companion for up to five seconds.
+Without that confirmation, normal failure detection remains active. Wake creates
+a fresh authenticated AirPlay session and repeats MRP initialization. Application
+interfaces and push listeners are retained, while cached playback and artwork are
+cleared. Commands sent while MRP is suspended or initializing fail; commands are
+never queued or replayed across sleep.
+
+Companion is checked with `FetchAttentionState` every 30 seconds. A matching error
+reply also proves liveness, since some tvOS versions do not support this query.
+If Companion stops responding while the device was last observed asleep, pyatv
+attempts one fresh authenticated Companion session, restores subscriptions, and
+verifies a response. This recovery has a 30-second total deadline. Failure of the
+new session is reported as a device disconnect. Active-device failures, failed
+MRP wake handshakes, and failures without confirmed sleep are also reported.
+Closing the device cancels recovery permanently.
+
 ### Data Channel
 The data channel carries messages related to the remote control. In reality, it's MRP messages
 (so protobuf). The same message definitions used by Media Remote Protocol are also valid

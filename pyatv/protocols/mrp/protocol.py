@@ -45,7 +45,10 @@ class ProtocolState(Enum):
     READY = 3
     """Protocol state is ready."""
 
-    STOPPED = 4
+    SUSPENDED = 4
+    """Transport retired while waiting for a new session."""
+
+    STOPPED = 5
     """Protocol state is stopped."""
 
 
@@ -112,13 +115,15 @@ class MrpProtocol(MessageDispatcher[int, protobuf.ProtocolMessage]):
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._outstanding: Dict[str, asyncio.Future] = {}
         self._state: ProtocolState = ProtocolState.NOT_CONNECTED
+        self._initializing_task: Optional[asyncio.Task] = None
 
     async def start(self, skip_initial_messages: bool = False) -> None:
         """Connect to device and listen to incoming messages."""
-        if self._state != ProtocolState.NOT_CONNECTED:
+        if self._state not in (ProtocolState.NOT_CONNECTED, ProtocolState.SUSPENDED):
             raise exceptions.InvalidStateError(self._state.name)
 
         self._state = ProtocolState.CONNECTING
+        self._initializing_task = asyncio.current_task()
 
         try:
             await self.connection.connect()
@@ -156,16 +161,31 @@ class MrpProtocol(MessageDispatcher[int, protobuf.ProtocolMessage]):
             # Subscribe to updates at this stage
             await self.send_and_receive(messages.client_updates_config())
             await self.send_and_receive(messages.get_keyboard_session())
-        except Exception:
-            # Something went wrong, let's do cleanup
-            self.stop()
+        except (Exception, asyncio.CancelledError):
+            # Suspension can interrupt startup when the receiver goes back to
+            # sleep. Keep that state resumable; every other failure is terminal.
+            if self._state != ProtocolState.SUSPENDED:
+                self.stop()
             raise
+        finally:
+            self._initializing_task = None
 
         # We're now ready
         self._state = ProtocolState.READY
 
+    def suspend(self) -> None:
+        """Retire the current transport while retaining protocol listeners."""
+        if self._state == ProtocolState.STOPPED:
+            return
+        self._disconnect()
+        self._state = ProtocolState.SUSPENDED
+
     def stop(self) -> None:
-        """Disconnect from device and fail pending requests."""
+        """Permanently disconnect from device."""
+        self._disconnect()
+        self._state = ProtocolState.STOPPED
+
+    def _disconnect(self) -> None:
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
@@ -177,7 +197,6 @@ class MrpProtocol(MessageDispatcher[int, protobuf.ProtocolMessage]):
         self._outstanding.clear()
         self.device_info = None
         self.connection.close()
-        self._state = ProtocolState.STOPPED
 
     def enable_heartbeat(self) -> None:
         """Enable sending periodic heartbeat messages."""
@@ -219,7 +238,10 @@ class MrpProtocol(MessageDispatcher[int, protobuf.ProtocolMessage]):
         if self._state not in [
             ProtocolState.CONNECTED,
             ProtocolState.READY,
-        ]:
+        ] or (
+            self._initializing_task is not None
+            and self._initializing_task is not asyncio.current_task()
+        ):
             raise exceptions.InvalidStateError(self._state.name)
 
         self.connection.send(message)
@@ -234,7 +256,10 @@ class MrpProtocol(MessageDispatcher[int, protobuf.ProtocolMessage]):
         if self._state not in [
             ProtocolState.CONNECTED,
             ProtocolState.READY,
-        ]:
+        ] or (
+            self._initializing_task is not None
+            and self._initializing_task is not asyncio.current_task()
+        ):
             raise exceptions.InvalidStateError(self._state.name)
 
         # Some messages will respond with the same identifier as used in the

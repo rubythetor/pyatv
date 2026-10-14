@@ -196,6 +196,7 @@ class PlayerStateManager:
 
     def _add_listeners(self) -> None:
         listeners = {
+            pb.SET_CONNECTION_STATE_MESSAGE: self._connection_state_changed,
             pb.SET_STATE_MESSAGE: self._handle_set_state,
             pb.UPDATE_CONTENT_ITEM_MESSAGE: self._handle_content_item_update,
             pb.SET_NOW_PLAYING_CLIENT_MESSAGE: self._handle_set_now_playing_client,
@@ -207,6 +208,17 @@ class PlayerStateManager:
         }
         for message, handler in listeners.items():
             self.protocol.listen_to(message, handler)
+
+    async def reset(self) -> None:
+        """Forget session state while retaining the push listener."""
+        self._clients.clear()
+        self._active_client = None
+        self.volume_controls_available = None
+        await self._state_updated()
+
+    async def _connection_state_changed(self, message) -> None:
+        if pb.extract_inner(message).state == pb.SetConnectionStateMessage.Disconnected:
+            await self.reset()
 
     def get_client(self, client: pb.NowPlayingClient) -> Client:
         """Return client based on player path."""

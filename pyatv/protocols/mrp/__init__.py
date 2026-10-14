@@ -1105,6 +1105,13 @@ def create_with_connection(  # pylint: disable=too-many-locals
     protocol = MrpProtocol(
         connection, SRPAuthHandler(), core.service, core.settings.info
     )
+    return create_with_protocol(core, protocol, requires_heatbeat)
+
+
+def create_with_protocol(  # pylint: disable=too-many-locals
+    core: Core, protocol: MrpProtocol, requires_heatbeat: bool = True
+) -> SetupData:
+    """Set up stable MRP interfaces around a protocol instance."""
     psm = PlayerStateManager(protocol)
 
     remote_control = MrpRemoteControl(core.loop, psm, protocol)
@@ -1125,6 +1132,8 @@ def create_with_connection(  # pylint: disable=too-many-locals
     }
 
     async def _connect() -> bool:
+        await psm.reset()
+        metadata.artwork_cache = Cache(limit=4)
         await protocol.start()
         if requires_heatbeat:
             protocol.enable_heartbeat()

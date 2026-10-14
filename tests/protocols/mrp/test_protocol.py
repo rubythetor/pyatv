@@ -10,6 +10,7 @@ from pyatv import exceptions
 from pyatv.auth.hap_srp import SRPAuthHandler
 from pyatv.conf import ManualService
 from pyatv.const import Protocol
+from pyatv.protocols.mrp import messages
 from pyatv.protocols.mrp.connection import MrpConnection
 from pyatv.protocols.mrp.protocol import (
     HEARTBEAT_INTERVAL,
@@ -81,3 +82,24 @@ async def test_cancelled_request_is_removed(mrp_protocol):
     with pytest.raises(asyncio.CancelledError):
         await pending
     assert not mrp_protocol._outstanding
+
+
+@pytest.mark.asyncio
+async def test_resume_repeats_handshake(mrp_atv, mrp_protocol, monkeypatch):
+    await mrp_protocol.start()
+    # AirPlay detaches its old channel listener before closing. The plain MRP
+    # transport used by this fixture normally treats every EOF as terminal.
+    monkeypatch.setattr(mrp_protocol.connection, "connection_lost", lambda exc: None)
+    mrp_protocol.suspend()
+    with pytest.raises(exceptions.InvalidStateError):
+        await mrp_protocol.send(messages.get_keyboard_session())
+    await mrp_protocol.start()
+    response = await mrp_protocol.send_and_receive(messages.get_keyboard_session())
+    assert response.type == 23
+
+
+@pytest.mark.asyncio
+async def test_terminal_stop_cannot_resume(mrp_protocol):
+    mrp_protocol.stop()
+    with pytest.raises(exceptions.InvalidStateError):
+        await mrp_protocol.start()

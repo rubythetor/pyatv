@@ -25,10 +25,9 @@ from pyatv.interface import (
     RemoteControl,
     Stream,
 )
-from pyatv.protocols import mrp
 from pyatv.protocols.airplay.ap2_session import AP2Session
 from pyatv.protocols.airplay.auth import extract_credentials
-from pyatv.protocols.airplay.mrp_connection import AirPlayMrpConnection
+from pyatv.protocols.airplay.mrp_tunnel import AirPlayMrpTunnel
 from pyatv.protocols.airplay.pairing import AirPlayPairingHandler
 from pyatv.protocols.airplay.player import AirPlayPlayer
 from pyatv.protocols.airplay.utils import (
@@ -232,72 +231,12 @@ async def service_info(
 
 
 def _create_mrp_tunnel_data(core: Core, credentials: HapCredentials):
-    session = AP2Session(
-        str(core.config.address), core.service.port, credentials, core.settings.info
-    )
-
-    # A protocol requires its corresponding service to function, so add a
-    # dummy one if we don't have one yet
-    mrp_service = core.config.get_service(Protocol.MRP)
-    if mrp_service is None:
-        mrp_service = MutableService(None, Protocol.MRP, core.service.port, {})
-        core.config.add_service(mrp_service)
-
-    (
-        _,
-        mrp_connect,
-        mrp_close,
-        mrp_device_info,
-        mrp_interfaces,
-        mrp_features,
-    ) = mrp.create_with_connection(
-        Core(
-            core.loop,
-            core.config,
-            mrp_service,
-            core.settings,
-            core.device_listener,
-            core.session_manager,
-            core.takeover,
-            core.state_dispatcher.create_copy(Protocol.MRP),
+    return AirPlayMrpTunnel(
+        core,
+        lambda: AP2Session(
+            str(core.config.address), core.service.port, credentials, core.settings.info
         ),
-        AirPlayMrpConnection(session, core.device_listener),
-        requires_heatbeat=False,  # Already have heartbeat on control channel
-    )
-
-    async def _connect_rc() -> bool:
-        try:
-            await session.connect()
-            await session.setup_remote_control()
-            session.start_keep_alive(core.device_listener)
-        except exceptions.HttpError as ex:
-            if ex.status_code == 470:
-                raise exceptions.InvalidCredentialsError(
-                    "invalid or missing credentials"
-                ) from ex
-            raise
-        except Exception as ex:
-            raise exceptions.ProtocolError(
-                "Failed to set up remote control channel"
-            ) from ex
-
-        await mrp_connect()
-        return True
-
-    def _close_rc() -> Set[asyncio.Task]:
-        tasks = set()
-        tasks.update(mrp_close())
-        tasks.update(session.stop())
-        return tasks
-
-    return SetupData(
-        Protocol.MRP,
-        _connect_rc,
-        _close_rc,
-        mrp_device_info,
-        mrp_interfaces,
-        mrp_features,
-    )
+    ).setup_data
 
 
 def setup(  # pylint: disable=too-many-locals
